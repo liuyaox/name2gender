@@ -126,7 +126,7 @@ def neural_network(vocab_len, embedding_dim=128, num_filters=128):
 
 
 # 模型训练
-def neural_network_train(epoches=201, dropout_keep_prob=0.5):
+def neural_network_train(epoches=201):
     output = neural_network(vocab_len)
  
     # 定义优化器、损失、梯度和优化operator
@@ -143,13 +143,14 @@ def neural_network_train(epoches=201, dropout_keep_prob=0.5):
                 batch_i, batch_j = i * batch_size, (i + 1) * batch_size
                 batch_x = train_x_vec[batch_i: batch_j]
                 batch_y = train_y[batch_i: batch_j]
-                _, loss_ = sess.run([train_op, loss], feed_dict={X: batch_x, Y: batch_y, dropout_keep_prob: dropout_keep_prob})
-                print(epoch, i, loss_)
-                
-            if epoch % 200 == 0:
+                _, loss_ = sess.run([train_op, loss], feed_dict={X: batch_x, Y: batch_y, dropout_keep_prob: 0.5})
+                if i % 100 == 0:
+                    print(epoch, i, loss_)
+                    
+            if epoch % 20 == 0:
                 saver.save(sess, "name2gender.model", global_step=epoch)   # 保存模型
  
-neural_network_train(50, 0.5)
+neural_network_train(50)
 
 
 # 模型应用
