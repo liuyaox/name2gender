@@ -8,7 +8,7 @@ Created on Tue Mar 12 21:53:18 2019
 import numpy as np
 from functools import reduce
 import tensorflow as tf
-from keras.layers import Input, Embedding, LSTM, Dropout, Dense, Flatten, Conv1D
+from keras.layers import Input, Embedding, Dropout, Dense, Conv1D, BatchNormalization
 from keras.layers import Concatenate, GlobalMaxPooling1D, GlobalAveragePooling1D
 from keras.models import Model
 from keras.optimizers import Adam
@@ -17,6 +17,7 @@ from keras.preprocessing.sequence import pad_sequences
 from keras.callbacks import EarlyStopping
 from keras_preprocessing.text import tokenizer_from_json
 from keras.models import load_model
+from keras.utils import plot_model
 from keras.initializers import Constant
 
 from data_preprocessing import get_data_xy, data_shuffle, get_vocabulary, name_to_vec
@@ -24,12 +25,26 @@ from data_preprocessing import get_data_xy, data_shuffle, get_vocabulary, name_t
 
 # 常量和基本配置
 name_dataset = './data/name.csv'
+pretrained_file_public = ''
+emb_dim_public = 200
+pretrained_file_title = ''
+emb_dim_title = 10
+structured_dim = 150  # 结构化向量的维度
+
 
 max_name_length, data_x, data_y = get_data_xy(name_dataset, header=True)
 max_name_length = 8
 data_x, data_y = data_shuffle(data_x, data_y)   
 vocab_len, vocabulary = get_vocabulary(data_x)
 data_x_vec = [name_to_vec(name, vocabulary, max_name_length) for name in data_x]
+
+
+# 训练/测试数据
+train_pword1, train_pword2, train_structured = None, None, None
+train_y = None
+test_pword1, test_pword2, test_structured = None, None, None
+test_y = None
+
 
 
 input_size = max_name_length
@@ -53,15 +68,18 @@ def get_word2vector(pretrained_file, emb_dim):
                 pass
     return word2vector
 
+word2vector_public = get_word2vector(pretrained_file_public, emb_dim_public)
+word2vector_title  = get_word2vector(pretrained_file_title,  emb_dim_title)
 
-def get_embedding_layer(initializer='constant', vocabulary=None, word2vector=None, emb_dim=None):
+
+def get_embedding_layer(initializer='constant', vocabulary=None, word2vector=None, emb_dim=128, name=None):
     """ Create Embedding Layer Using Random Initialization or Pretrained Word Embeddings """
     # Using random initialization
     if initializer != 'constant':
-        emb_layer = Embedding(vocab_len, emb_dim, embeddings_initializer=initializer, trainable=True) # 一般取uniform
+        emb_layer = Embedding(vocab_len, emb_dim, embeddings_initializer=initializer, name=name, trainable=True) # 一般取uniform
     # Using pre-trained word embeddings
     elif word2vector is not None and vocabulary is not None:
-        emb_dim = word2vector.get('a').shape[0]
+        emb_dim = word2vector.get('我').shape[0]
         emb_matrix = np.zeros((vocab_len, emb_dim))     # 此处难道不应该是vocab_len+1么？！？
         for word, index in vocabulary.items():          # vocabulary的index从1开始，0留给谁的？！？
             if index < vocab_len:
@@ -73,50 +91,70 @@ def get_embedding_layer(initializer='constant', vocabulary=None, word2vector=Non
                     vector = reduce(lambda x, y: x + y, vectors) / len(vectors)
                 if vector is not None:
                     emb_matrix[index, :] = vector       # index=0没有赋值，留给谁？！？
-        emb_layer = Embedding(vocab_len, emb_dim, embeddings_initializer=Constant(emb_matrix), trainable=False)
+        emb_layer = Embedding(vocab_len, emb_dim, embeddings_initializer=Constant(emb_matrix), name=name, trainable=False)
     else:
         print('ERROR! There is no vocabulary or word2vector!')
     return emb_layer
 
+# 4 Embedding Layers
+emb_layer_public  = get_embedding_layer('constant', vocabulary, word2vector_public, name='emb_public') # For both pword1 and pword2, since trainable=False ?
+emb_layer_title   = get_embedding_layer('constant', vocabulary, word2vector_title, name='emb_title')
+emb_layer_random1 = get_embedding_layer('uniform', emb_dim=128, name='emb_random1')     # For pword1, since its trainable=True ?
+emb_layer_random2 = get_embedding_layer('uniform', emb_dim=128, name='emb_random2')     # For pword2
 
-def TextCNN(input_shape, emb_layer, fsizes=[2, 3, 4], units=32):
-    """ TextCNN: Embedding -> (Conv1D -> MaxPooling) * n -> Concatenate -> Dense """
-    X0 = Input(input_shape, dtype='int32')
-    X = emb_layer(X0)                                       # (None, maxlen, emb_dim)
+
+def TextCNN(X, fsizes=[2, 3, 4], units=32, name=None):
+    """ TextCNN: (Embedding) -> (Conv1D -> MaxPooling) * n -> Concatenate -> Dense """
     Xs = []
     for fsize in fsizes:
         Xi = Conv1D(128, fsize, activation='relu')(X)       # (None, maxlen-fsize+1, 128)
         Xi = GlobalMaxPooling1D()(Xi)                       # (None, 128)
         Xs.append(Xi)
-    X = Concatenate(axis=-1)(Xs)                            # (None, 128*3)
+    X = Concatenate(axis=-1, name=name)(Xs)                            # (None, 128*3)
     X = Dropout(0.5)(X)
     X = Dense(units=units, activation='relu')(X)            # (None, units)
-#    X = Dense(units=1, activation='sigmoid')(X)             # (None, 1)
-#    model = Model(X0, X)
     return X
 
 
+def Model_TextCNN(input_shapes):
+    """ TextCNN-based Model with 3 Inputs and 1 Output """
+    # 3 Inputs
+    pword1 = Input(input_shapes[0], dtype='int32', name='pword1')
+    pword2 = Input(input_shapes[1], dtype='int32', name='pword2')
+    structured = Input(input_shapes[2], dtype='float32', name='structured')   # float32 ?
+    # 6 Embedded Inputs
+    pword1_emb_public = emb_layer_public(pword1)        # (None, max_name_length, emb_dim)
+    pword1_emb_title  = emb_layer_title(pword1)
+    pword1_emb_random = emb_layer_random1(pword1)
+    pword2_emb_public = emb_layer_public(pword2)
+    pword2_emb_title  = emb_layer_title(pword2)
+    pword2_emb_random = emb_layer_random2(pword2)
+    # 2 Concatenated Inputs
+    pword1_embs = Concatenate(axis=-1, name='pword1_embs')([pword1_emb_public, pword1_emb_title, pword1_emb_random])
+    pword2_embs = Concatenate(axis=-1, name='pword2_embs')([pword2_emb_public, pword2_emb_title, pword2_emb_random])
+    # 2 TextCNNs
+    pword1_textcnn = TextCNN(pword1_embs, fsizes=[2, 3, 4], units=32, name='pword1_textcnn')
+    pword2_textcnn = TextCNN(pword2_embs, fsizes=[2, 3, 4], units=32, name='pword2_textcnn')
+    # All Concatenated
+    X = Concatenate(axis=-1, name='x_concat')([pword1_textcnn, pword2_textcnn, structured])
+    X = BatchNormalization()(X)                         # Necessary ?
+    X = Dropout(0.5)(X)                                 # Necessary ?
+    X = Dense(units=32, activation='relu')(X)
+    X = Dense(units=1, activation='sigmoid')(X)
+    return Model([pword1, pword2, structured], X)
+
+input_shapes = [(max_name_length, ), (max_name_length, ), (structured_dim, )] 
+model = Model_TextCNN(input_shapes)
 
 
-inputs = Input(shape=(maxlen,))
-inter = Embedding(output_dim=embedding_dims, input_dim=max_words, input_length=maxlen)(inputs)
-inter = Conv1D(filters, kernel_size, padding='valid', activation='relu', strides=1)(inter)
-inter = GlobalMaxPooling1D()(inter)
-inter = Dense(10, activation='relu')(inter)
-
-price_input = Input(shape=(1,))
-
-comb_inter = concatenate([inter, price_input])
-
-comb_inter = BatchNormalization()(comb_inter)
-outputs = Dense(n_cate, activation='softmax')(comb_inter)
-
-model2 = Model(inputs=[inputs, price_input], outputs=outputs)
+# 模型配置
+model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+model.summary()
+plot_model(model)
 
 
-model2.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
-model2.summary()
-model2.fit([x, price_train], train_labels, epochs=20, batch_size=32)
-accuracy = model2.evaluate([x_test, price_test], test_labels)[1]
-y_pred2 = model2.predict([x_test, price_test])
-y_predict2 = y_pred2.argmax(1)
+# 模型训练、评估和应用
+model.fit([train_pword1, train_pword2, train_structured], train_y, epoches=50, batch_size=32)
+accuracy = model.evaluate([test_pword1, test_pword2, test_structured], test_y)[1]
+pred = model.predict([[test_pword1, test_pword2, test_structured]])
+pred2 = pred.argmax(1)
