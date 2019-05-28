@@ -2,6 +2,8 @@
 # Liuyao
 .DS_Store
 model/
+*.pdf
+*.vsd
 
 
 # Byte-compiled / optimized / DLL files
